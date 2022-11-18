@@ -1,0 +1,840 @@
+---
+title: "AF PRS vs. AF after revascularization"
+editor_options:
+  chunk_output_type: console
+output:
+  html_document:
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+#packrat::init()
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+
+**Libraries**
+
+
+```{r}
+#setwd("/finngen/red/cabg_prs")
+
+#install.packages("/home/ivm/R/src/packrat_0.5.0.tar.gz", repos=NULL, type="source")
+#install.packages("/finngen/green/tableone_0.12.0.tar.gz", repos=NULL, type="source")
+#install.packages("/finngen/green/compareC_1.3.1.tar.gz", repos=NULL, type="source")
+
+#packrat::on()
+library(tidyverse)
+library(survival)   # survival analysis
+
+library(data.table) # fread() function
+library(gridExtra)  # plots to grid
+library(survminer)  # ggbased visualization and extra diagnostics
+#library(survRM2)    # restricted mean survival times
+#library(visdat)     # visualization of tibble and na's
+##library(forestplot) # forestplot
+library(compareC)   # compare c-index
+library(kableExtra) # Pretty tables
+library(tableone)   # Characteristics table
+
+source('/finngen/red/cabg_prs/scripts/functions2.R')
+
+data_path <- "/finngen/red/cabg_prs/data"
+prs_path <- "/finngen/red/cabg_prs/data/ukb_prs"
+fig_path <- "/finngen/red/cabg_prs/figs"
+
+```
+
+
+# Data
+
+## Variables
+
+**Operations**
+
+* I9_CABG, Coronary artery bypass crafting
+* I9_ANGIO, Coronary angiopasty
+* I9_REVASC, I9_CABG OR I9_ANGIO
+
+Three samples: patients *after* CABG, ANGIO and REVASC.
+
+**For polygenic riskscores**
+
+* I9_AF (ukb: 20002_1471), Atrial fibrillation
+
+**For clinical riskscore CHA~2~DS~2~-VASc:**
+
+* Congestive heart failure = I9_HEARTFAIL
+* Hypertension = I9_HYPTENS
+* Diabetes mellitus = E4_DIABETES
+* Stroke, TIA, or TE = C_STROKE
+* Vascular disease = I9_MI or I9_PAD
+
+## Download & preprocess data
+
+
+**Copying and preprocessing outside R**
+
+Endpoint and covariate files transfered and unzipped. Columns selected from endpoint file prior to import to r, because the original phenotype file is very large.
+
+
+```{bash, eval=F}
+
+#Endpoint file and covariate files unzipped
+phenodir="/finngen/red/cabg_prs/data/phenotypes"
+gzip -dc /finngen/library-red/finngen_R6/phenotype_2.0/data/finngen_R6_v2_endpoint.gz > $phenodir/finngen_R6_v2_endpoint
+gzip -dc /finngen/library-red/finngen_R6/phenotype_2.0/data/finngen_R6_cov_pheno_1.0.txt.gz > $phenodir/finngen_R6_cov_pheno_1.0.txt
+
+#Self written perl-script to extract columns from phenotype file (runned from directory 'scripts')
+phenodir="/finngen/red/cabg_prs/data/phenotypes"
+perl select_columns.pl $phenodir/finngen_R6_v2_endpoint        $phenodir/finngen_R6_v2_CABG    fg_pheno_cols.txt &
+perl select_columns.pl $phenodir/finngen_R6_cov_pheno_1.0.txt  $phenodir/R6_cov_pheno_selected fg_cov_cols.txt &
+perl select_columns.pl $phenodir/finngen_R6_v2_endpoint       $phenodir/finngen_R6_v2_chadsvasc    fg_chadsvasc_cols.txt &
+#perl select_columns.pl $phenodir/finngen_R6_cov_pheno_1.0.txt  $phenodir/finngen_R6_v2_chadsvasc    fg_chadsvasc_cols.txt &
+
+```
+
+
+**Loading and combining the data**
+
+Downloading the data.
+
+```{r}
+
+names_in <- list("I9_AF")
+
+#PRS scores
+prs_df <- lapply(names_in, function(name) {
+  fread(str_glue("{prs_path}/ukb.{name}.both_sexes.profile")) %>%
+        select(IID, SCORE) %>%
+      rename(FINNGENID = IID, !!paste(name, "SCORE", sep="_") := SCORE)}
+  ) %>%
+  reduce(left_join, by = "FINNGENID")
+
+#endpoints and covariates
+phenotypes <- fread(str_glue("{data_path}/phenotypes/finngen_R6_v2_CABG"), sep = "\t") 
+covs_in <- fread(str_glue("{data_path}/phenotypes/R6_cov_pheno_selected"), sep = "\t")
+pheno_chdvsc <- fread(str_glue("{data_path}/phenotypes/finngen_R6_v2_chadsvasc"), sep = "\t") %>%
+  select(-contains('MI')) #To avoid duplicates
+
+```
+
+Combining the data.
+
+```{r}
+df <- phenotypes %>%
+  left_join(prs_df, by = "FINNGENID") %>%
+  left_join(covs_in, by = "FINNGENID") %>%
+  left_join(pheno_chdvsc, by = "FINNGENID") %>%
+  as_tibble() %>%
+  mutate_at(c("batch","cohort"),as.factor) 
+
+```
+
+
+**Preprocess**
+
+Removing individuals without genetic information.
+Also endpointnames are simplified.
+
+```{r}
+#
+#glimpse(df)
+#vis_dat(sample_n(df, 10000))
+df <- df %>% filter(!is.na(batch)) %>%
+  rename_at(vars(contains('I9_')), list(~str_remove(., "I9_"))) %>%
+  rename_at(vars(contains('K11_')), list(~str_remove(., "K11_"))) %>%
+  rename_at(vars(contains('E4_')), list(~str_remove(., "E4_"))) %>%
+  rename_at(vars(contains('C_STRO')), list(~str_remove(., "C_"))) %>%
+  rename_at(vars(contains('ANGIO')), list(~str_replace(., "ANGIO", "PCI")))
+#vis_dat(sample_n(df, 10000))
+
+#Number of individuals:
+#dim(df)[1]
+
+```
+
+
+Creating scaled & categorical variables.
+
+
+```{r}
+
+#my_probs = c(0 ,0.2, 0.8, 1)
+#my_labels =  c(">20%","20-80%",">80")
+
+#my_probs = c(0 , 0.1, 0.2, 0.8, 0.9, 1)
+#my_labels =  c(">10%", "10-20%", "20-80%", "80-90%", ">90%")
+
+my_probs = c(0,0.025,0.2,0.8,0.975,1)
+my_labels =  c("<2.5%","2.5-20%","20-80%","80-97.5%",">97.5%")
+
+df <- df %>%
+  mutate(AF_SCALED = scale(AF_SCORE),
+         AF_CAT = cut(AF_SCORE, breaks=quantile(df$AF_SCORE, my_probs),
+                            labels=my_labels, include.lowest = T))
+
+```
+
+
+**Variable names redefined**
+
+
+```{r}
+names_oper <- list("REVASC", "CABG", "PCI")
+names_ep <- list("AF")
+```
+
+
+**Number of individuals, AF, sex and age**
+
+Age is age at end of followup.
+
+```{r}
+
+#Sex and age
+df %>%
+  summarise(N=n(), N_AF = sum(AF, na.rm = T), AF_perc = mean(AF, na.rm = T)*100 ,N_fem = sum(SEX_IMPUTED), fem_perc = mean(SEX_IMPUTED)*100, end_age = mean(FU_END_AGE), end_age_sd = sd(FU_END_AGE)) %>%
+    knitr::kable(digits=1) %>%  kable_styling()
+
+```
+
+
+## Subset the data by operations
+
+**Create datasets for each operations**
+
+Lists with three datasets for each operations created
+
+```{r}
+
+#Datasets for each operation are filtered.
+#As FinnGen assignes NA's to similar endpoints, we must replace NA's for
+#AF and MI by zero, or they do not have observations.
+
+dfs.oper <- lapply(names_oper, function(name){
+    df %>% filter(get(name) == 1) %>%
+    mutate(AF = if_else(is.na(AF), as.integer(0), AF),
+           MI = if_else(is.na(MI), as.integer(0), MI))
+  }) %>% setNames(names_oper) 
+
+
+```
+
+
+**CHA~2~DS~2~-VASc score**
+
+```{r}
+
+#Chadsvasc score:
+
+dfs.oper <- lapply(names_oper, function(oper){
+  
+  oper_age <- str_glue("{oper}_AGE")
+  dfs.oper[[oper]] %>%
+  mutate(MIPAD = if_else(MI|PAD, 1, 0)) %>%
+  rowwise()%>%
+  mutate(MIPAD_AGE = min(MI_AGE, PAD_AGE)) %>%
+  ungroup() %>%
+  mutate(CVSC_AGE_65 = if_else(get(oper_age) >= 65, 1, 0),   
+         CVSC_AGE_75 = if_else(get(oper_age) >= 75, 1, 0),
+         CVSC_AGE_65_75 = if_else((CVSC_AGE_65 == 1 & CVSC_AGE_75 == 0),1, 0),
+         CVSC_HEARTFAIL = if_else(HEARTFAIL_AGE < get(oper_age), 1, 0),
+         CVSC_HYPTENS = if_else(HYPTENS_AGE < get(oper_age), 1, 0),
+         CVSC_DIABETES = if_else(DIABETES_AGE < get(oper_age), 1, 0),
+         CVSC_STROKE = if_else(STROKE_AGE < get(oper_age), 1, 0),
+         CVSC_MIPAD = if_else(MIPAD_AGE < get(oper_age), 1, 0), 
+         preop_VHD = if_else(VHD_AGE < get(oper_age), 1, 0),                      
+         preop_OBESITY = if_else(OBESITY_AGE < get(oper_age), 1, 0),
+         CVSC = CVSC_HEARTFAIL + CVSC_HYPTENS + CVSC_AGE_75 + CVSC_DIABETES + 
+           2*CVSC_STROKE + CVSC_MIPAD + CVSC_AGE_65 + SEX_IMPUTED, 
+         CVSC_SCALED = scale(CVSC))
+  
+}) %>% setNames(names_oper) 
+
+```
+
+Correlation between clinical and genetic score:
+
+```{r}
+
+#Pearson
+lapply(names_oper, function(oper){
+  cor(dfs.oper[[oper]][["CVSC_SCALED"]],dfs.oper[[oper]][["AF_SCALED"]], method = "pearson")
+})%>% setNames(names_oper) %>% unlist()
+
+#Spearman
+lapply(names_oper, function(oper){
+  cor(dfs.oper[[oper]][["CVSC_SCALED"]],dfs.oper[[oper]][["AF_SCALED"]], method = "spearman")
+})%>% setNames(names_oper) %>% unlist()
+
+```
+
+
+**Prevalent cases removed**
+
+```{r}
+
+#Datasets for each operation are filtered and added to list
+
+covs <- c("SEX_IMPUTED", "batch", "BL_YEAR","PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8","PC9", "PC10")
+
+#Lists of dataframes for each operations and each endpoint of interest
+#PREVALENT ARE REMOVED
+
+dfs <- lapply(names_oper, function(oper){
+  my_create_sub_dfs(oper, dfs.oper, names_ep, covs) }) %>% 
+  setNames(names_oper) 
+
+#list of dataframes is simplified as we have now only one endpoint of interest, AF
+dfs.af <- lapply(names_oper, function(oper){
+  dfs[[oper]][["AF"]] }) %>%
+  setNames(names_oper) 
+
+
+```
+
+**Mean followup time**
+
+```{r}
+
+lapply(names_oper, function(oper){
+  dfs.af[[oper]] %>%
+    summarise(mean = mean(AGE_DIFF), median = median(AGE_DIFF))
+})%>% setNames(names_oper)
+
+
+```
+
+
+
+
+## Characteristics tables for each operations
+
+Here all characteristics are at the age of operation. 
+
+```{r}
+
+myVars <-   c("AGE_DIFF", "AF_AGE", "SEX_IMPUTED", "CVSC", "CVSC_HEARTFAIL", "CVSC_HYPTENS", "CVSC_AGE_75", "CVSC_DIABETES", 
+              "CVSC_STROKE", "CVSC_MIPAD", "CVSC_AGE_65_75", "preop_VHD", "preop_OBESITY")
+
+catVars <-  c("SEX_IMPUTED", "CVSC_HEARTFAIL", "CVSC_HYPTENS", "CVSC_AGE_75", "CVSC_DIABETES", 
+              "CVSC_STROKE", "CVSC_MIPAD", "CVSC_AGE_65_75", "preop_VHD", "preop_OBESITY")
+
+chr_rownames <- c("Follow up, years (SD)", "Age, years (SD)", "Women, n (%)", "CHA2DS2-VASc score (SD)", "Hearth failure, n (%)", "Hypertension, n (%)", "Age > 74, n (%)",
+              "Diabetes, n (%)", "Prior stroke or TIA, n (%)", "Vascular disease, n (%)", "Age 65-75, n (%)")
+
+my_char_table(dfs.af[["REVASC"]], "AF", myVars, catVars, chr_rownames, name="REVASC") %>%
+  knitr::kable() %>% kable_styling()
+
+my_char_table(dfs.af[["CABG"]], "AF", myVars, catVars, chr_rownames, name="CABG") %>%
+  knitr::kable() %>% kable_styling()
+
+my_char_table(dfs.af[["PCI"]], "AF", myVars, catVars, chr_rownames, name="PCI") %>%
+  knitr::kable() %>% kable_styling()
+
+```
+
+## Linearized rate
+
+```{r}
+
+dfs.af[["REVASC"]] %>%
+    group_by(AF_CAT) %>%
+    summarise((sum(AF)/sum(FU_END_AGE-REVASC_AGE))*100)
+  
+dfs.af[["CABG"]] %>%
+    group_by(AF_CAT) %>%
+    summarise((sum(AF)/sum(FU_END_AGE-CABG_AGE))*100)
+
+dfs.af[["PCI"]] %>%
+    group_by(AF_CAT) %>%
+    summarise((sum(AF)/sum(FU_END_AGE-PCI_AGE))*100)
+
+
+
+```
+
+
+
+
+# Survival analysis
+
+**AF after each three operation : **
+
+* Model1: Covariates: {oper}_AGE, SEX_IMPUTED, batch, BL_YEAR, PC1:PC10
+* Model2: Covariates: CHA~2~DS~2~-VASc, {oper}_AGE, SEX_IMPUTED, batch, BL_YEAR, PC1:PC10
+  
+
+## Proportional hazard assumption: log log curve
+
+<details><summary>**KM & log log curves**</summary>
+
+**Model by survfit**
+
+```{r}
+
+kms <- 
+  lapply(names_oper, function(oper){
+    lapply(names_ep, function(ep){
+      survfit(Surv(AGE_DIFF, get(ep)) ~ get(str_glue("{ep}_CAT")), data=dfs[[oper]][[ep]])
+    }) %>% setNames(names_ep)
+  }) %>% setNames(names_oper) 
+
+```
+
+
+**KM plots**
+
+```{r, fig.width=5, fig.height=4}
+
+for(oper in unlist(names_oper)) {
+  ep=names_ep[[1]]   #Tämän alustuksen tarve on kyllä ihme juttu. Suoritus kaatuu ilman sitä.
+  
+  plot_list <- lapply(names_ep, function(ep){
+    #print(str_glue("{oper}-{ep}"))
+    my_ggkmplot(kms[[oper]][[ep]], str_glue("{oper}-{ep}"), my_labels, isFive=T) 
+  }) 
+  plots <- arrange_ggsurvplots(plot_list, nrow = 1, ncol = 1, title = "Kaplan Meier curves")
+  #ggsave(file = str_glue("{fig_path}/km.prs.after.{oper}.png"), plot = plots, height = 6, width = 12, dpi = 200)
+}
+
+
+```
+
+
+
+**log log curve**
+
+
+```{r, fig.width=5, fig.height=4}
+
+for(oper in unlist(names_oper)) {
+  ep=names_ep[[1]]   #Tämän alustuksen tarve on kyllä ihme juttu. Suoritus kaatuu ilman sitä.
+  
+  plot_list <- lapply(names_ep, function(ep){
+    #print(str_glue("{oper}-{ep}"))
+    my_ggkmplot(kms[[oper]][[ep]], str_glue("{oper}-{ep}"), my_labels, fun="cloglog", xlim=c(0.1,30), isFive=T)
+    
+  }) 
+  plots <- arrange_ggsurvplots(plot_list, nrow = 1, ncol = 1, title = "log-log curves")
+  #ggsave(file = str_glue("{fig_path}/log.prs.after.{oper}.png"), plot = plots, height = 6, width = 12, dpi = 200)
+}
+
+
+```
+
+
+</details>
+<br>
+
+
+## Cox model: covariate adjusted, continuous score
+
+
+**Running models**
+
+
+```{r}
+covs_f<- paste(covs, collapse = " + ")
+
+# Only PRS
+ep <- "AF"
+
+cxs.cs.both <- 
+  lapply(names_oper, function(oper){
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_SCALED + CVSC_SCALED + {oper}_AGE + {covs_f}")
+      coxph(as.formula(my_formula), data=dfs.af[[oper]])
+  }) %>% setNames(names_oper) 
+
+
+```
+
+
+**Table: Hazard rations**
+
+
+```{r}
+
+hr.cs.tables <- 
+  lapply(names_oper, function(oper){
+
+  nN <- dfs.af[[oper]] %>% 
+    summarize(sum(AF), n()-sum(AF)) %>%
+    unite("nN", sep="/")
+  
+  my_extr_coef(cxs.cs.both[[oper]], "PRS", select="AF_SCALED") %>%
+    my_tidy_table() %>%
+    cbind(.,nN) %>%
+    select(name, est, pval, nN) %>%
+    rename(!!oper := name, `HR (95% CI)` = est, `P-value` = pval, `Cases/Controls` = nN) #%>%
+    #mutate("P-value" = sub("e(-\\d+)", "x10<sup>\\1</sup>", `P-value`, perl=T))   #html-version/proper exponents
+  
+}) %>% setNames(names_oper)
+
+hr.cs.tables$REVASC %>% knitr::kable() %>% kable_styling()
+hr.cs.tables$CABG %>% knitr::kable() %>% kable_styling()
+hr.cs.tables$PCI %>% knitr::kable() %>% kable_styling()
+
+```
+
+
+*Sex & age of operation included*
+
+```{r}
+
+#SEX and AGE
+my_cxlist_to_hrtable_selected(cxs.cs.both, "name", select="SEX|AGE") %>% 
+  knitr::kable(digits=2) %>%
+  kable_styling()
+
+```
+
+
+
+<details><summary>**All coefficients**</summary>
+
+
+```{r}
+
+#lapply(cxs.cs.prs, print)
+lapply(cxs.cs.both, print)
+#lapply(cxs.cs.cvsc, print)
+
+```
+
+Genetic covariates are not significant. Only very few exceptions. 
+
+
+</details>
+<br>
+
+<details><summary>**Proportional hazard assumption**</summary>
+
+Schoenfeld residuals against the transformed time
+
+
+```{r}
+extract_ph_test <- function(cx){
+  tmp <- cox.zph(cx)
+  tmp$table[c(1,2, 3, 16),]
+}
+
+lapply(names_oper, function(oper){
+  tryCatch(extract_ph_test(cxs.cs.both[[oper]]), error=function(e) NULL)
+}) %>% setNames(names_oper) 
+
+```
+
+</details>
+<br>
+
+
+## Cox model: covariate adjusted, categorized score
+
+
+**Running models**
+
+
+```{r}
+
+ep="AF"
+
+cxs.both <- 
+  lapply(names_oper, function(oper){
+      df_tmp <- dfs.af[[oper]] %>%
+        mutate(!!str_glue("{ep}_CAT") := relevel(get(str_glue("{ep}_CAT")), ref = "20-80%"))
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_CAT + CVSC_SCALED + {oper}_AGE + {covs_f}")
+      coxph(as.formula(my_formula), data=df_tmp)
+  }) %>% setNames(names_oper) 
+
+```
+
+
+**Table: Hazard ratios:**
+
+
+```{r, fig.width=12}
+
+#Model 2
+hr2 <- lapply(names_oper, function(oper){
+  my_cx_to_hrtable_cat(cxs.both[[oper]], dfs.af[[oper]], ep, select="_CAT", title=oper)
+})  %>% setNames(names_oper) 
+#  do.call(cbind, .) 
+
+#Combined. Here repeated extra columns with quantilies are removed
+hr2$REVASC %>%  knitr::kable() %>% kable_styling()
+hr2$CABG %>%  knitr::kable() %>% kable_styling()
+hr2$PCI %>%  knitr::kable() %>% kable_styling()
+
+```
+
+
+**Selecting covariates for plot**
+
+We used **mean** values for all numeric variables. For 'batch', we use the level with **lowest significance**.
+
+
+<details><summary>**Choosing covariate values**</summary>
+
+
+The batches were not significant, so this does not really matter. 
+Let us take lowest significance from a one example case: REVASC-AF
+
+```{r}
+
+cx.test <- cxs.both$REVASC
+
+summary(cx.test)$coefficients %>%
+  as.data.frame() %>%
+  mutate(name = row.names(.)) %>%
+  rename(pval="Pr(>|z|)") %>%
+  select("name", "coef", "exp(coef)","se(coef)", "pval") %>%  
+  arrange(pval)
+
+
+
+```
+
+Batch: AxiomGT1_b44_V2.calls had both low p-value and effect size. It is chosen.
+
+</details>
+<br>
+
+
+**Cox-plot**
+
+Creating covariate combinations for the plot.
+
+
+```{r}
+
+exp.cxs2 <- 
+  lapply(names_oper, function(oper){
+
+    exp.tmp.covs <-  my_expand_covs(dfs.af[[oper]], batch = "AxiomGT1_b44_V2.calls")
+    exp.tmp.vars <- expand.grid(AF_CAT = levels(dfs.af[[oper]][["AF_CAT"]]),
+                                CVSC_SCALED = mean(dfs.af[[oper]][["CVSC_SCALED"]]),
+                                TEST = mean(dfs.af[[oper]][[str_glue("{oper}_AGE")]]),
+                                SEX_IMPUTED = 0.5) %>%
+                    rename(!!str_glue("{oper}_AGE") := TEST)
+   
+    bind_cols(exp.tmp.vars, exp.tmp.covs)
+    
+  }) %>% setNames(names_oper)   
+
+
+fit.cxs2 <- 
+  lapply(names_oper, function(oper){
+        survfit(cxs.both[[oper]], newdata = exp.cxs2[[oper]])
+}) %>% setNames(names_oper) 
+
+```
+
+
+And the plot:
+
+```{r, fig.width=12, fig.height=4}
+
+oper="REVASC"
+p1 <- my_ggcoxplot(fit.cxs2[[oper]], exp.cxs2[[oper]], "Revascularization", rev(my_labels), xlim=c(0,30), ylim=c(0,0.9), legend = "none")[["plot"]]
+
+oper="CABG"
+p2 <- my_ggcoxplot(fit.cxs2[[oper]], exp.cxs2[[oper]], str_glue("{oper}"), my_labels, xlim=c(0,30), ylim=c(0,0.9), legend="none", ylab="")[["plot"]]
+
+oper="PCI"
+p3 <- my_ggcoxplot(fit.cxs2[[oper]], exp.cxs2[[oper]], str_glue("{oper}"), my_labels, xlim=c(0,30), ylim=c(0,0.9), legend="none", ylab="")[["plot"]] 
+
+lgnd <- my_ggcoxplot(fit.cxs2[[oper]], exp.cxs2[[oper]], "Revascularization", rev(my_labels), legend="right", legend.title="AF PRS")[["plot"]] %>%
+         get_legend()
+
+plots2 <- grid.arrange(p1, p2, p3, lgnd, ncol = 4, widths = c(3,3,3,1))
+
+ggsave(file = str_glue("{fig_path}/cx.prs.af2.png"), plot = plots2, height = 3, width = 10, dpi = 300)
+ggsave(file = str_glue("{fig_path}/cx.prs.af2.eps"), plot = plots2, device = cairo_ps, height = 3, width = 10, dpi = 300)
+
+
+```
+
+
+
+
+## C-statistics for AF
+
+
+
+## Cox model: covariate adjusted, continuous score
+
+
+**Running models**
+
+
+```{r}
+covs_f<- paste(covs, collapse = " + ")
+
+# Only PRS
+ep <- "AF"
+
+
+# Model1, only CHADSVASC
+cxs.cs.m1 <- 
+  lapply(names_oper, function(oper){
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ CVSC_SCALED + {oper}_AGE + {covs_f}")
+      coxph(as.formula(my_formula), data=dfs.af[[oper]])
+  }) %>% setNames(names_oper) 
+
+
+
+# Model2, CHADSVASC + VHD + OBESITY
+cxs.cs.m2 <- 
+  lapply(names_oper, function(oper){
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ CVSC_SCALED + preop_OBESITY + preop_VHD + {oper}_AGE + {covs_f}")
+      coxph(as.formula(my_formula), data=dfs.af[[oper]])
+  }) %>% setNames(names_oper) 
+
+
+
+# Model3, PRS + CHADSVASC + VHD + OBESITY
+cxs.cs.m3 <- 
+  lapply(names_oper, function(oper){
+      my_formula <- str_glue("Surv(AGE_DIFF, {ep}) ~ {ep}_SCALED + CVSC_SCALED + preop_OBESITY + preop_VHD + {oper}_AGE + {covs_f}")
+      coxph(as.formula(my_formula), data=dfs.af[[oper]])
+  }) %>% setNames(names_oper) 
+
+```
+
+**HR/1SD change:**
+
+
+CA~2~HDS~2~-VASc only:
+
+```{r}
+#Model1
+my_cxlist_to_hrtable_selected(cxs.cs.m1, "Operation", select="_SCALED|preop") %>% 
+  knitr::kable(digits=2) %>%
+  kable_styling()
+
+```
+
+
+
+CA~2~HDS~2~-VASc + obesity + VHD:
+
+```{r}
+
+my_cxlist_to_hrtable_selected(cxs.cs.m2, "Operation", select="_SCALED|preop") %>% 
+  knitr::kable(digits=2) %>%
+  kable_styling()
+
+```
+
+
+CA~2~HDS~2~-VASc + obesity + VHD + PRS:
+
+```{r}
+
+my_cxlist_to_hrtable_selected(cxs.cs.m3, "Operation", select="_SCALED|preop") %>% 
+  knitr::kable(digits=2) %>%
+  kable_styling()
+
+```
+
+**Cox plot: CA~2~HDS~2~-VASc + PRS**
+
+Creating covariate combinations for the plot.
+
+```{r}
+
+exp.cs.cxs3 <- 
+  lapply(names_oper, function(oper){
+       my_expand_cs_cvsc3(cxs.m3[[oper]],  "AF_SCALED", dfs.af[[oper]], 
+                  batch = "AxiomGT1_b44_V2.calls", agename=str_glue("{oper}_AGE"), 
+                  #var_qs = quantile(dfs.af[[oper]][["AF_SCALED"]], c(0.8413, 0.1587)), 
+                  #scr_qs = quantile(dfs.af[[oper]][["CVSC_SCALED"]], c(0.8413, 0.1587)))
+                  var_qs = quantile(dfs.af[[oper]][["AF_SCALED"]], c(0.9, 0.1)), 
+                  scr_qs = quantile(dfs.af[[oper]][["CVSC_SCALED"]], c(0.9, 0.1)))
+  }) %>% setNames(names_oper) 
+
+
+fit.cs.cxs3 <- 
+  lapply(names_oper, function(oper){
+        survfit(cxs.cs.m3[[oper]], newdata = exp.cs.cxs3[[oper]])
+}) %>% setNames(names_oper) 
+
+
+```
+
+
+
+And the plot:
+
+```{r, fig.width=12, fig.height=4}
+
+#label_name = expression('AF PRS - CHA'[2]*'DS'[2]*'-VASc')
+label_name = expression('AF PRS/CHA'[2]*'DS'[2]*'-VASc')
+#lab_tmp = c("90% - 90%", "10% - 90%", "90% - 10%", "10% - 10%")
+lab_tmp = c("1SD/1SD", "-1SD/1SD", "1SD/-1SD", "-1SD/-1SD")
+#palette=c("#C77CFF",  "#00BFC4",  "#7CAE00", "#F8766D") #ggplot default reversed
+
+oper="REVASC"
+p1 <- ggsurvplot(fit.cs.cxs3[[oper]], data =  exp.cs.cxs3[[oper]], 
+               fun = "event", censor = F, conf.int=F, ggtheme = theme_bw(),
+               xlim=c(0,30), ylim=c(0,0.9), break.time.by=5, legend="none",
+               size=0.5, font.tickslab=9.5, font.legend=9.5, title="Revascularization")[["plot"]]
+
+oper="CABG"
+p2 <- ggsurvplot(fit.cs.cxs3[[oper]], data =  exp.cs.cxs3[[oper]], 
+               fun = "event", censor = F, conf.int=F, ggtheme = theme_bw(),
+               xlim=c(0,30), ylim=c(0,0.9), break.time.by=5, legend="none",
+               size=0.5, font.tickslab=9.5, font.legend=9.5, title=oper)[["plot"]]
+
+oper="PCI"
+p3 <- ggsurvplot(fit.cs.cxs3[[oper]], data =  exp.cs.cxs3[[oper]], 
+               fun = "event", censor = F, conf.int=F, ggtheme = theme_bw(),
+               xlim=c(0,30), ylim=c(0,0.9), break.time.by=5, legend="none",
+               size=0.5, font.tickslab=9.5, font.legend=9.5, title=oper)[["plot"]]
+
+lgnd <- ggsurvplot(fit.cs.cxs3[[oper]], data =  exp.cs.cxs3[[oper]], censor = F,
+                   legend.title=label_name, legend.labs=lab_tmp, legend="right",
+                   size=0.5, font.tickslab=9.5, font.legend=9.5)[["plot"]] %>%
+        get_legend()
+
+plots2 <- grid.arrange(p1,p2, p3, lgnd, ncol = 4, widths = c(3,3,3,2))
+
+#ggsave(file = str_glue("{fig_path}/cx.prs.af.m3sd.png"), plot = plots2, height = 3, width = 11, dpi = 300)
+#ggsave(file = str_glue("{fig_path}/cx.prs.af.m3sd.eps"), plot = plots2, device = cairo_ps, height = 3, width = 10.6, dpi = 300)
+
+
+```
+
+
+
+**C-index**
+
+```{r}
+
+cindex_table <- 
+  lapply(names_oper, function(oper){
+    compc<- compareC(timeX = dfs.af[[oper]][["AGE_DIFF"]],
+                     statusX = dfs.af[[oper]][["AF"]],
+                     scoreY= 1 - cxs.cs.m3[[oper]][["linear.predictors"]], # '-' kääntää järjestyksen
+                     scoreZ= 1 - cxs.cs.m2[[oper]][["linear.predictors"]])
+    est <- prettify_estimate(estimate=compc$est.diff, stderr=sqrt(compc$est.vardiff_c), r=3)
+    tibble(Name=oper, m1=round(cxs.cs.m1[[oper]]$concordance[6],4), Cxy=round(compc$est.c[1],4), Cxz=round(compc$est.c[2],4), 
+           diff_est=est, diff_pval=signif(compc$pval,1))
+}) %>%
+do.call(rbind, .) %>%
+select(Name, m1, Cxz, Cxy, diff_est, diff_pval) %>%
+rename(Procedure=Name, `Model 1`=m1, `Model 3`=Cxy, `Model 2`=Cxz, `Difference (95% CI)`=diff_est, `P-value`=diff_pval) 
+
+
+cindex_table %>%
+knitr::kable() %>%
+  kable_styling()
+
+#Felix: En nyt ole varma miksi tuo standard error lasketaan ottamalla varianssista neliöjuuri, eikä myös jakamalla samplen koon neliöjuurella. 'Normaalistihan' tuossa kaavassa pitäisi olla jakajana sqrt(var)/sqrt(n) eikä pelkkä sqrt(var). Koska CI myötäilee P-arvoa tapauksessa P=0.05, niin olen aika varma.
+
+
+```
+
+.
