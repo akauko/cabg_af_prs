@@ -8,17 +8,17 @@ We used GWAS summaries from UKBB GWAS v3: https://docs.google.com/spreadsheets/d
 
 ```
 cabg_af_prs
-├── README.md                 		  # Overview
-├── cabg_prs_after_download.rmd     # R markdown for the analysis with all outcomes
-├── cabg_prs_after_download.html    # html generated from rmd file 'cabg_prs_after_download.rmd'
-├── cabg_af_prs_download.rmd     	  # R markdown for the detailed analysis with AF only
-├── cabg_af_prs_download.html    	  # html generated from rmd file 'cabg_af_prs_download.rmd'
-├── functions2.R      				      # Minor R functions for the main analysis
-├── select_columns.pl         		  # Perl script to select columns from tsv files by column name
-├── prs_calculations		  		      # Directory: PRS calculations
-	├── preprocess_ukb_for_prscs.bash	    # Preprocesses ukb gwas summary statistics for PRS-CS
-	├── prs_ukb3.wdl					            # Runs PRS-CS at FinnGen for one endpoint and all sexes.
-	├── generate_prs_scores.bash		      # Processes PRS_CS output and calculates weights for FinnGen individuals
-	├── reformat_raw_prs.R 				        # Is required by 'generate_prs_scores.bash'
+├── README.md                 		# Overview
+├── cabg_prs_after_download.rmd     	# R markdown for the analysis with all outcomes
+├── cabg_prs_after_download.html    	# html generated from rmd file 'cabg_prs_after_download.rmd'
+├── cabg_af_prs_download.rmd     	# R markdown for the detailed analysis with AF only
+├── cabg_af_prs_download.html    	# html generated from rmd file 'cabg_af_prs_download.rmd'
+├── functions2.R      			# Minor R functions for the main analysis
+├── select_columns.pl         		# Perl script to select columns from tsv files by column name
+├── prs_calculations		  		# Directory: PRS calculations
+	├── preprocess_ukb_for_prscs.bash	# Preprocesses ukb gwas summary statistics for PRS-CS
+	├── prs_ukb3.wdl			# Runs PRS-CS at FinnGen for one endpoint and all sexes.
+	├── generate_prs_scores.bash		# Processes PRS_CS output and calculates weights for FinnGen individuals
+	├── reformat_raw_prs.R 			# Is required by 'generate_prs_scores.bash'
 
 ```
