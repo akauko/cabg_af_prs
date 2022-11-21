@@ -1,5 +1,5 @@
 # cabg_af_prs
-Code for the publication: Aittokallio, Jenni, et al. "Polygenic Risk Scores for Predicting Adverse Outcomes After Coronary Revascularization." The American Journal of Cardiology 167 (2022): 9-14.
+Code for the publication: Aittokallio, J., et al. "Polygenic Risk Scores for Predicting Adverse Outcomes After Coronary Revascularization." The American Journal of Cardiology 167 (2022): 9-14.
 https://doi.org/10.1016/j.amjcard.2021.11.046
 
 * Data: FinnGen (https://www.finngen.fi/en)
